@@ -3,10 +3,9 @@
 Pipeline:
     physical camera -> OpenCV capture -> MediaPipe Face Mesh (468 landmarks)
     -> alpha-blended PNG overlay positioned/rotated/scaled to the face
-    -> pyvirtualcam sink (OBS Virtual Camera / Unity Capture)
+    -> pyvirtualcam sink (OBS Virtual Camera or Unity Capture)
 
-Windows only. Requires Python 3.10 64-bit and a virtual camera driver
-(OBS Virtual Camera is the default choice).
+Windows only. Requires Python 3.10-3.12 64-bit.
 """
 
 import math
@@ -48,8 +47,9 @@ except Exception:
 UNITY_CAPTURE_URL = "https://github.com/schellingb/UnityCapture"
 OBS_DOWNLOAD_URL = "https://obsproject.com/"
 
-CAMERA_PROBE_MAX_INDEX = 9
 TARGET_FPS = 30
+PROBE_INDICES_MAX = 9
+CAMERA_READ_FAILURE_LIMIT = 60  # consecutive failed reads tolerated (~1-3 s)
 
 # ---------------------------------------------------------------- styling ---
 
@@ -163,6 +163,104 @@ STATUS_COLORS = {
 }
 
 
+# ------------------------------------------------------------ camera probe --
+
+
+def list_camera_names():
+    """Friendly names of DirectShow video input devices, in index order.
+
+    Uses pygrabber (comtypes) so the chooser can show real device names;
+    the returned order matches OpenCV's CAP_DSHOW index order. Returns []
+    when pygrabber is unavailable or COM fails - callers fall back to
+    "Camera {index}" labels and blind probing.
+    """
+    try:
+        import comtypes
+        from pygrabber.dshow_graph import FilterGraph
+    except Exception:
+        return []
+    try:
+        comtypes.CoInitialize()
+    except Exception:
+        pass
+    try:
+        return [str(name) for name in FilterGraph().get_input_devices()]
+    except Exception:
+        return []
+
+
+def probe_camera(index: int):
+    """Return (ok, detail) for a camera index.
+
+    A camera counts as usable only if it opens AND delivers at least one
+    real frame. Tries DirectShow first, then Media Foundation, since some
+    cameras only work with one of them.
+    """
+    detail = []
+    for backend, backend_name in ((cv2.CAP_DSHOW, "DirectShow"),
+                                  (cv2.CAP_MSMF, "MediaFoundation")):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                detail.append(f"{backend_name}: open failed")
+                continue
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            got_frame = False
+            for _ in range(5):
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.size:
+                    got_frame = True
+                    break
+            if got_frame:
+                return True, None
+            detail.append(f"{backend_name}: opened but delivered no frames")
+        except Exception as exc:
+            detail.append(f"{backend_name}: {exc}")
+        finally:
+            if cap is not None:
+                cap.release()
+    return False, "; ".join(detail)
+
+
+class CameraScanner(QThread):
+    """Background scan so the UI never freezes while probing cameras.
+
+    Only cameras that pass probe_camera() are reported - the chooser lists
+    active, frame-delivering devices exclusively.
+    """
+
+    scanned = Signal(list)  # list of {"index", "name", "detail"}
+
+    def __init__(self):
+        super().__init__()
+        self._abort = False
+
+    def abort(self):
+        """Stop after the current probe; cannot interrupt a blocking read."""
+        self._abort = True
+
+    def run(self):
+        names = list_camera_names()
+        if names:
+            indices = range(min(len(names), PROBE_INDICES_MAX + 1))
+        else:
+            indices = range(PROBE_INDICES_MAX + 1)
+        ready = []
+        for index in indices:
+            if self._abort:
+                break
+            ok, detail = probe_camera(index)
+            if ok:
+                ready.append({
+                    "index": index,
+                    "name": names[index] if index < len(names) else "",
+                    "detail": detail or "",
+                })
+        if not self._abort:
+            self.scanned.emit(ready)
+
+
 # ------------------------------------------------------------- processing ---
 
 
@@ -175,8 +273,8 @@ class CaptureThread(QThread):
     widgets from the worker side.
     """
 
-    frame_ready = Signal(object)   # RGB uint8 ndarray (H, W, 3)
-    status_changed = Signal(str, str)  # text, kind in {"running", "error"}
+    frame_ready = Signal(object)       # RGB uint8 ndarray (H, W, 3)
+    status_changed = Signal(str, str)  # text, kind in {"running", "error", "error-soft"}
 
     def __init__(self, camera_index: int, width: int, height: int, parent=None):
         super().__init__(parent)
@@ -220,16 +318,42 @@ class CaptureThread(QThread):
 
     # ---- worker ----
 
+    def _open_camera(self):
+        """Open with DirectShow, fall back to Media Foundation.
+
+        Some cameras only cooperate with one of the two backends. MJPG is
+        requested before the resolution so 1080p runs at full frame rate on
+        cameras that default to YUY2.
+        """
+        errors = []
+        for backend, backend_name in ((cv2.CAP_DSHOW, "DirectShow"),
+                                      (cv2.CAP_MSMF, "MediaFoundation")):
+            cap = cv2.VideoCapture(self._camera_index, backend)
+            if not cap.isOpened():
+                cap.release()
+                errors.append(f"{backend_name}: open failed")
+                continue
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+            cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap, None
+            cap.release()
+            errors.append(f"{backend_name}: opened but delivered no frames")
+        return None, "; ".join(errors)
+
     def run(self) -> None:
-        cap = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
+        cap, open_error = self._open_camera()
+        if cap is None:
             self.status_changed.emit(
                 f"Error: No device at index {self._camera_index}", "error")
             return
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
 
         if _mp is not None:
             try:
@@ -259,12 +383,20 @@ class CaptureThread(QThread):
 
         self.status_changed.emit("Running", "running")
 
+        failures = 0
         while self._running:
             ok, frame = cap.read()
-            if not ok:
-                self.status_changed.emit(
-                    f"Error: No device at index {self._camera_index}", "error")
-                break
+            if not ok or frame is None:
+                # Single failed reads happen on healthy cameras; only give
+                # up after a sustained run of them.
+                failures += 1
+                if failures > CAMERA_READ_FAILURE_LIMIT:
+                    self.status_changed.emit(
+                        f"Error: No device at index {self._camera_index}", "error")
+                    break
+                self.msleep(15)
+                continue
+            failures = 0
 
             # Drivers sometimes ignore the requested resolution; normalize so
             # the virtual camera dimensions always match the pushed frames.
@@ -330,8 +462,8 @@ class CaptureThread(QThread):
         al = cv2.resize(overlay_alpha, (target_w, target_h), interpolation=interp)
 
         # Positive atan2 angle (right eye lower on screen) means the overlay
-        # must rotate clockwise on screen, i.e. negative getRotationMatrix2D
-        # angle, because that function is positive-counter-clockwise.
+        # must rotate clockwise on screen; getRotationMatrix2D is positive-
+        # counter-clockwise, hence the negated angle (verified empirically).
         rot_matrix = cv2.getRotationMatrix2D(
             (target_w / 2.0, target_h / 2.0), -angle, 1.0)
         ov = cv2.warpAffine(ov, rot_matrix, (target_w, target_h),
@@ -362,6 +494,24 @@ class CaptureThread(QThread):
 # --------------------------------------------------------------------- UI ---
 
 
+def probe_virtual_camera():
+    """Open and immediately close a virtual camera to detect a usable driver.
+
+    Works with the OBS Virtual Camera and Unity Capture backends; returns
+    (ok, error_detail). Camera() with no backend tries every registered
+    backend in order, so any installed driver satisfies the probe.
+    """
+    if pyvirtualcam is None:
+        return False, "pyvirtualcam is not installed"
+    try:
+        cam = pyvirtualcam.Camera(640, 480, fps=30,
+                                  fmt=pyvirtualcam.PixelFormat.RGB)
+        cam.close()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 class MainWindow(QWidget):
     PREVIEW_W, PREVIEW_H = 780, 440
 
@@ -372,7 +522,10 @@ class MainWindow(QWidget):
         self.setStyleSheet(STYLESHEET)
 
         self.thread = None
+        self.scanner = None
         self._pending_overlay = None  # (rgb, alpha) applied when capture starts
+        self._ready_cameras = []
+        self._scanning = False
         self._no_signal_pixmap = self._make_no_signal_pixmap()
         self._vcam_ok, self._vcam_detail = probe_virtual_camera()
 
@@ -403,6 +556,13 @@ class MainWindow(QWidget):
         self.resolution_box.addItem("1080p", (1920, 1080))
         self.resolution_box.setCurrentIndex(0)
         row1.addWidget(self.resolution_box)
+
+        self.rescan_button = QPushButton("Rescan")
+        self.rescan_button.setFixedSize(80, 26)
+        self.rescan_button.setToolTip(
+            "Re-detect cameras. Only devices that actually deliver frames are listed.")
+        self.rescan_button.clicked.connect(self._start_scan)
+        row1.addWidget(self.rescan_button)
 
         row1.addStretch()
         root.addLayout(row1)
@@ -469,31 +629,14 @@ class MainWindow(QWidget):
         root.addLayout(row3)
 
         # ---- startup sequence ----
-        self._enumerate_cameras()
         self._check_virtual_camera()
+        self._update_start_enabled()
+        self._start_scan()
 
-    # ---- startup helpers ----
-
-    @staticmethod
-    def _enumerate_camera_indices():
-        found = []
-        for index in range(CAMERA_PROBE_MAX_INDEX + 1):
-            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                found.append(index)
-            cap.release()
-        return found
-
-    def _enumerate_cameras(self):
-        for index in self._enumerate_camera_indices():
-            self.camera_box.addItem(f"Camera {index}", index)
-        if self.camera_box.count() == 0:
-            self.start_button.setEnabled(False)
-            self._set_status("Error: No device at index 0", "error")
+    # ---- virtual camera ----
 
     def _check_virtual_camera(self):
         if not self._vcam_ok:
-            self.start_button.setEnabled(False)
             tip = (f"A virtual camera driver is required (OBS Virtual Camera "
                    f"or Unity Capture).\n\n{self._vcam_detail}\n\n"
                    f"OBS: {OBS_DOWNLOAD_URL}\nUnity Capture: {UNITY_CAPTURE_URL}")
@@ -503,6 +646,63 @@ class MainWindow(QWidget):
             self.start_button.setToolTip(
                 "Outputs to the first available virtual camera "
                 "(OBS Virtual Camera or Unity Video Capture).")
+
+    # ---- camera scanning ----
+
+    def _start_scan(self):
+        if self._scanning or self.thread is not None:
+            return
+        self._scanning = True
+        self._ready_cameras = []
+        self.camera_box.clear()
+        self.camera_box.addItem("Scanning...", -1)
+        self.camera_box.setEnabled(False)
+        self._update_start_enabled()
+        if self._vcam_ok:
+            self._set_status("Scanning cameras...", "idle")
+        old = self.scanner
+        self.scanner = CameraScanner()
+        self.scanner.scanned.connect(self._on_scan_finished)
+        self.scanner.start()
+        if old is not None:
+            try:
+                old.deleteLater()
+            except RuntimeError:
+                pass  # already destroyed
+
+    def _on_scan_finished(self, cameras):
+        self._scanning = False
+        self._ready_cameras = cameras
+        self.camera_box.clear()
+        for cam in cameras:
+            label = (f"Camera {cam['index']} - {cam['name']}"
+                     if cam["name"] else f"Camera {cam['index']}")
+            self.camera_box.addItem(label, cam["index"])
+            if cam["name"]:
+                self.camera_box.setItemData(
+                    self.camera_box.count() - 1, cam["name"],
+                    Qt.ItemDataRole.ToolTipRole)
+        self.camera_box.setEnabled(True)
+        if cameras:
+            self.camera_box.setCurrentIndex(0)
+            if self._vcam_ok:
+                self._set_status("Idle", "idle")
+        elif self._vcam_ok:
+            self._set_status("Error: No camera found", "error")
+            self.status_label.setToolTip(
+                "No camera delivered frames. Close other apps that may be\n"
+                "using the camera, check the privacy settings\n"
+                "(Settings > Privacy > Camera), then click Rescan.")
+        self._update_start_enabled()
+
+    def _update_start_enabled(self):
+        can_start = (not self._scanning and self.thread is None
+                     and self._vcam_ok and bool(self._ready_cameras))
+        self.start_button.setEnabled(can_start)
+        self.rescan_button.setEnabled(not self._scanning and self.thread is None)
+        self.camera_box.setEnabled(not self._scanning and self.thread is None)
+        self.resolution_box.setEnabled(self.thread is None)
+        self.stop_button.setEnabled(self.thread is not None)
 
     @staticmethod
     def _make_no_signal_pixmap():
@@ -566,8 +766,10 @@ class MainWindow(QWidget):
     # ---- start / stop ----
 
     def _on_start(self):
+        if self._scanning or self.thread is not None:
+            return
         index = self.camera_box.currentData()
-        if index is None:
+        if index is None or index < 0:
             return
         width, height = self.resolution_box.currentData()
 
@@ -576,8 +778,7 @@ class MainWindow(QWidget):
         self.thread.status_changed.connect(self._on_worker_status)
         self.thread.finished.connect(self._on_thread_finished)
 
-        self.stop_button.setEnabled(True)
-        self.start_button.setEnabled(False)
+        self._update_start_enabled()
 
         self.thread.set_opacity(self.opacity_slider.value())
         self.thread.set_scale(self.scale_slider.value())
@@ -598,15 +799,14 @@ class MainWindow(QWidget):
                 f"Install OBS: {OBS_DOWNLOAD_URL}\n"
                 f"Or Unity Capture: {UNITY_CAPTURE_URL}")
         if kind == "error" and self.thread is not None:
-            # Fatal capture errors end the loop; the thread emits finished
-            # right after and button state is restored in _on_thread_finished.
+            # Fatal errors end the loop; the thread emits finished right
+            # after and button state is restored in _on_thread_finished.
             # "error-soft" (face mesh failed) keeps streaming in passthrough.
             self.thread.stop()
 
     def _on_thread_finished(self):
         self.thread = None
-        self.start_button.setEnabled(self.camera_box.count() > 0 and self._vcam_ok)
-        self.stop_button.setEnabled(False)
+        self._update_start_enabled()
         if self.status_label.text() == "Running":
             self._set_status("Idle", "idle")
         self.preview.setPixmap(self._no_signal_pixmap)
@@ -630,25 +830,13 @@ class MainWindow(QWidget):
         if self.thread is not None:
             self.thread.stop()
             self.thread.wait(3000)
+        if self.scanner is not None:
+            try:
+                self.scanner.abort()
+                self.scanner.wait(3000)
+            except RuntimeError:
+                pass  # already destroyed
         super().closeEvent(event)
-
-
-def probe_virtual_camera():
-    """Open and immediately close a virtual camera to detect a usable driver.
-
-    Works with the OBS Virtual Camera and Unity Capture backends; returns
-    (ok, error_detail). Camera() with no backend tries every registered
-    backend in order, so any installed driver satisfies the probe.
-    """
-    if pyvirtualcam is None:
-        return False, "pyvirtualcam is not installed"
-    try:
-        cam = pyvirtualcam.Camera(640, 480, fps=30,
-                                  fmt=pyvirtualcam.PixelFormat.RGB)
-        cam.close()
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
 
 
 def main():

@@ -80,13 +80,24 @@ the target machine.
 
 | Control | Function |
 |---|---|
-| Camera dropdown | Physical capture device (indices 0–9) |
+| Camera dropdown | **Active cameras only** — every listed device was probed and actually delivered frames. Shows real device names (e.g. `Camera 0 - HD Webcam`), newest scan via **Rescan** |
+| Rescan | Re-detect cameras without restarting |
 | Resolution | 720p (default) or 1080p |
 | Overlay | Load a `.png`/`.jpg`/`.jpeg` with alpha (JPEGs get full opacity) |
 | Clear | Remove the active overlay |
 | Opacity slider | 0–100 % blend of the overlay over the face (default 85) |
 | Scale slider | 50–200 % of the auto-computed face-box size (default 100) |
 | START / STOP | Open or release camera + virtual camera sink |
+
+## How camera detection works
+
+On startup and on **Rescan**, a background thread enumerates DirectShow video
+input devices (via `pygrabber`, which is why real names appear), then probes
+each one: a device is listed **only** if it can be opened *and* returns a real
+frame. Cameras held or disabled elsewhere never show up as fake entries.
+Capture itself opens with DirectShow and falls back to Media Foundation for
+cameras that need it, requests MJPG for full-rate 1080p, and tolerates brief
+read glitches instead of dying on the first dropped frame.
 
 ## How the tracking works
 

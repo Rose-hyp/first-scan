@@ -5,6 +5,7 @@ mediapipe>=0.10.9,<0.11
 pyvirtualcam>=0.10
 numpy>=1.24,<2
 Pillow>=10
+pygrabber>=0.2
 
 # Build tool (setup.bat / build.bat installs it automatically):
 # pyinstaller
