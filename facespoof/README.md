@@ -83,10 +83,12 @@ the target machine.
 | Camera dropdown | **Active cameras only** — every listed device was probed and actually delivered frames. Shows real device names (e.g. `Camera 0 - HD Webcam`), newest scan via **Rescan** |
 | Rescan | Re-detect cameras without restarting |
 | Resolution | 720p (default) or 1080p |
-| Overlay | Load a `.png`/`.jpg`/`.jpeg` with alpha (JPEGs get full opacity) |
+| Overlay | Load a `.png`/`.jpg`/`.jpeg` — plain photos get an **auto-cutout** (the face is detected and the person is cut out automatically; untick *Auto-cutout* to skip) |
 | Clear | Remove the active overlay |
 | Opacity slider | 0–100 % blend of the overlay over the face (default 85) |
 | Scale slider | 50–200 % of the auto-computed face-box size (default 100) |
+| Tracking HUD | Draws green boxes around every detected face — debugging aid; **the boxes are visible in the output**, turn off for real use |
+| Snapshot | Save the current composited frame as a PNG |
 | START / STOP | Open or release camera + virtual camera sink |
 
 ## How the overlay engine matches the face
@@ -101,7 +103,9 @@ Alignment is built from stable landmark anchors, then temporally filtered:
 2. **Yaw behavior** — the overlay's center follows the nose tip and its width
    narrows as the head turns, so it stays glued to the face in profile.
 3. **Feathered edges** — the alpha mask is gaussian-feathered (~6 % of
-   overlay size) on a rotation-expanded canvas so soft edges never clip.
+   overlay size) on a padded, rotation-expanded canvas so the melt into the
+   background is smooth at every angle and edges never clip (verified free of
+   dark fringes down to single-pixel rounding).
 4. **Skin match (optional, `Skin` checkbox)** — matches the overlay's
    brightness to the lighting on your face; for photographic overlays.
 5. **Speed** — Face Mesh runs on a 640 px-downscaled copy (landmarks are
@@ -122,15 +126,31 @@ read glitches instead of dying on the first dropped frame.
 
 ## How the tracking works
 
-MediaPipe Face Mesh (468 landmarks) runs per frame. The overlay is:
+Detection is **tiered so it never silently fails**:
+
+1. **MediaPipe face landmarks (468 points)** run per frame on a 640 px
+   downscaled copy. Both mediapipe generations are supported: the classic
+   `solutions` API, and — on mediapipe ≥ 0.10.35 which removed it — the
+   newer **Tasks FaceLandmarker**, whose model FaceSpoof downloads once to
+   `%LocalAppData%\facespoof` automatically.
+2. **OpenCV Haar-cascade fallback** — if MediaPipe is unavailable, crashes,
+   or finds nothing (small/off-angle faces), an OpenCV cascade detector
+   takes over the same frame. This tier keeps working even if MediaPipe
+   fails to initialize completely.
+3. **Adaptive retry** — while a face is considered lost, detection
+   periodically retries at full resolution before giving up.
+
+Up to **3 faces** are tracked simultaneously — each gets its own filter and
+warp-cache slot, so several people can each wear the overlay. Per face the
+overlay is:
 
 1. sized to the detected face bounding box × scale × 1.2 padding,
 2. rotated to the eye line (landmarks 33/133 vs 362/263) via `warpAffine`,
 3. centered on the face box, cropped at frame edges,
 4. alpha-blended at the chosen opacity.
 
-If no face is detected the raw frame passes through untouched. If MediaPipe
-fails to initialize the app keeps streaming in passthrough (no overlay).
+If no face is detected the raw frame passes through untouched (enable the
+**Tracking HUD** to see exactly what the detector sees).
 
 ## Troubleshooting
 

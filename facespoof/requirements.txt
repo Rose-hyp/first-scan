@@ -1,7 +1,12 @@
 # Windows, Python 3.10 - 3.12, 64-bit
 PySide6>=6.6
-opencv-python>=4.9
-mediapipe>=0.10.9,<0.11
+# <5: OpenCV 5.x wheels drop cv2.CascadeClassifier + the Haar XML data the
+# detection fallback tier relies on.
+opencv-python>=4.9,<5
+# <0.10.30: newer 0.10.x wheels (>=0.10.35) removed the legacy
+# mediapipe.solutions API; FaceSpoof auto-falls back to the Tasks API there,
+# but the solutions path is the battle-tested default.
+mediapipe>=0.10.14,<0.10.30
 pyvirtualcam>=0.10
 numpy>=1.24,<2
 Pillow>=10
