@@ -24,9 +24,11 @@ creates `.venv` and installs everything. Then use:
 - **`run.bat`** — start the app
 - **`build.bat`** — compile `dist\FaceSpoof.exe`
 
-If setup.bat reports no suitable Python: install Python 3.10, 3.11 or 3.12
-(**64-bit**) from https://www.python.org/downloads/ and tick
-**"Add python.exe to PATH"** in the installer, then run setup.bat again.
+If setup.bat finds no suitable Python it **downloads Python 3.12.10 64-bit
+from python.org and installs it automatically** — per-user, silently, with
+PATH configured. No admin rights, no manual steps, existing Python installs
+are left alone. setup.bat also finds Pythons that are *not* on PATH (registry
+or standard install folders) and adds them to your user PATH by itself.
 
 ## Setup (manual)
 
