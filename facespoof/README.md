@@ -12,16 +12,37 @@ by presenting an overlay instead.
 ## Requirements
 
 - Windows 10/11
-- Python 3.10, 64-bit
+- Python 3.10, 3.11 or 3.12 — **64-bit** (MediaPipe has no wheels outside 3.9–3.12)
 - A virtual camera driver — install [OBS Studio](https://obsproject.com/)
   (its bundled "OBS Virtual Camera" is the default sink)
 
-## Setup
+## Setup (easy way)
+
+Double-click **`setup.bat`**. It finds a suitable Python (3.10–3.12, 64-bit),
+creates `.venv` and installs everything. Then use:
+
+- **`run.bat`** — start the app
+- **`build.bat`** — compile `dist\FaceSpoof.exe`
+
+If setup.bat reports no suitable Python: install Python 3.10, 3.11 or 3.12
+(**64-bit**) from https://www.python.org/downloads/ and tick
+**"Add python.exe to PATH"** in the installer, then run setup.bat again.
+
+## Setup (manual)
+
+Run each of these as its **own command** — do not paste them as a single line:
 
 ```bat
-py -3.10-64 -m venv .venv
+py -3.12-64 -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+If `py -3.12-64` reports no runtime, try `py -3.11-64`, `py -3.10-64`, or see
+what is registered with `py -0`. Then run the app from the same prompt:
+
+```bat
+python facespoof.py
 ```
 
 ## Run from source
@@ -37,9 +58,11 @@ until OBS (or Unity Capture) is installed.
 ## Build the .exe
 
 ```bat
-pip install pyinstaller
 build.bat
 ```
+
+(or manually: `python -m pip install pyinstaller`, then
+`python -m PyInstaller --onefile --noconsole --name FaceSpoof --add-data "mediapipe;mediapipe" --add-data "cv2;cv2" facespoof.py`)
 
 Output: `dist\FaceSpoof.exe` — standalone, no Python installation needed on
 the target machine.

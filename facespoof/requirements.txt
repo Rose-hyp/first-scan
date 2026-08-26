@@ -1,10 +1,10 @@
-# Windows, Python 3.10 64-bit
-PySide6>=6.6,<7
-opencv-python>=4.9,<5
+# Windows, Python 3.10 - 3.12, 64-bit
+PySide6>=6.6
+opencv-python>=4.9
 mediapipe>=0.10.9,<0.11
-pyvirtualcam>=0.10,<0.11
+pyvirtualcam>=0.10
 numpy>=1.24,<2
-Pillow>=10,<11
+Pillow>=10
 
-# Build tool (only needed to compile the .exe):
-# pyinstaller>=6.0
+# Build tool (setup.bat / build.bat installs it automatically):
+# pyinstaller
