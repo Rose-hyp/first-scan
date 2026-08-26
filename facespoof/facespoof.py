@@ -445,6 +445,7 @@ class CaptureThread(QThread):
         self._slots = [self._new_slot() for _ in range(MAX_FACES)]
         self._haar = None
         self._show_tracking = False
+        self._black_on_lost = False
         self._frame_idx = 0
         self._lost_frames = 0
         self._gain = 1.0
@@ -479,6 +480,16 @@ class CaptureThread(QThread):
 
     def set_show_tracking(self, enabled: bool) -> None:
         self._show_tracking = bool(enabled)
+
+    def set_black_on_lost(self, enabled: bool) -> None:
+        self._black_on_lost = bool(enabled)
+
+    def _apply_no_face_policy(self, rgb, faces_found: bool) -> None:
+        """Privacy fail-safe: when no face carries the overlay, black the
+        frame instead of leaking the raw feed to the virtual camera."""
+        if faces_found or not self._black_on_lost or not self._overlay_present:
+            return
+        rgb[:] = 0
 
     @staticmethod
     def _new_slot():
@@ -618,9 +629,13 @@ class CaptureThread(QThread):
                     self._lost_frames += 1
                     if self._lost_frames == FACE_LOST_RESET_FRAMES:
                         self._reset_tracking()
-                # No face: emit the untouched frame.
+                    self._apply_no_face_policy(rgb, False)
                 if self._show_tracking:
                     self._draw_hud(rgb, faces, det_scale)
+            elif self._overlay_present:
+                # Engine in passthrough but an overlay is loaded: the
+                # privacy fail-safe still protects the feed.
+                self._apply_no_face_policy(rgb, False)
 
             self.frame_ready.emit(rgb)
             vcam.send(rgb)
@@ -1171,6 +1186,14 @@ class MainWindow(QWidget):
             "The boxes are visible in the output - turn off for real use.")
         row4.addWidget(self.hud_check)
 
+        self.privacy_check = QCheckBox("Black if no face")
+        self.privacy_check.setToolTip(
+            "Privacy fail-safe: when no face is detected to carry the overlay\n"
+            "(or tracking is down), the output turns to a black screen instead\n"
+            "of showing your real face. Applies live - toggle any time.")
+        self.privacy_check.toggled.connect(self._on_privacy_toggled)
+        row4.addWidget(self.privacy_check)
+
         self.snapshot_button = QPushButton("Snapshot")
         self.snapshot_button.setFixedSize(100, 26)
         self.snapshot_button.setToolTip(
@@ -1328,6 +1351,10 @@ class MainWindow(QWidget):
         except Exception:
             self._set_status("Error: Snapshot failed", "error")
 
+    def _on_privacy_toggled(self, on: bool):
+        if self.thread is not None:
+            self.thread.set_black_on_lost(on)
+
     def _on_opacity_changed(self, value: int):
         self.opacity_label.setText(f"{value}%")
         if self.thread is not None:
@@ -1363,6 +1390,7 @@ class MainWindow(QWidget):
         self.thread.set_scale(self.scale_slider.value())
         self.thread.set_skin_match(self.skin_check.isChecked())
         self.thread.set_show_tracking(self.hud_check.isChecked())
+        self.thread.set_black_on_lost(self.privacy_check.isChecked())
         if self._pending_overlay is not None:
             rgb, alpha = self._pending_overlay
             self.thread.set_overlay(rgb, alpha)
