@@ -51,6 +51,11 @@ TARGET_FPS = 30
 PROBE_INDICES_MAX = 9
 CAMERA_READ_FAILURE_LIMIT = 60  # consecutive failed reads tolerated (~1-3 s)
 
+MESH_MAX_WIDTH = 640       # face mesh runs on a downscaled frame (landmarks
+                           # are normalized, so coordinates are unchanged)
+FACE_LOST_RESET_FRAMES = 15  # frames without a face before filters reset
+FEATHER_FRACTION = 0.06    # alpha edge feather as fraction of overlay size
+
 # ---------------------------------------------------------------- styling ---
 
 STYLESHEET = """
@@ -154,6 +159,24 @@ QSlider::handle:horizontal:hover {
 QSlider::sub-page:horizontal {
     background: #1A1A1A;
 }
+QCheckBox {
+    color: #B0B0B0;
+    font-size: 9pt;
+    spacing: 6px;
+}
+QCheckBox::indicator {
+    width: 13px;
+    height: 13px;
+    border: 1px solid #2A2A2A;
+    background: #1A1A1A;
+}
+QCheckBox::indicator:hover {
+    border-color: #555555;
+}
+QCheckBox::indicator:checked {
+    background: #7ACC7A;
+    border-color: #2A5A2A;
+}
 """
 
 STATUS_COLORS = {
@@ -161,6 +184,52 @@ STATUS_COLORS = {
     "running": "#7ACC7A",
     "error": "#CC7A7A",
 }
+
+
+# -------------------------------------------------------------- smoothing ---
+
+
+class OneEuroFilter:
+    """1-euro adaptive low-pass filter (Casiez et al. 2012).
+
+    The same technique Google's FaceLandmarker applies to landmarks in
+    streaming mode: heavy smoothing when the face is still (no jitter),
+    nearly no lag during fast motion (adaptive cutoff rises with speed).
+    """
+
+    def __init__(self, x0, min_cutoff=1.2, beta=0.02, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev = float(x0)
+        self.dx_prev = 0.0
+        self.t_prev = None
+
+    @staticmethod
+    def _alpha(dt, cutoff):
+        r = 2.0 * math.pi * cutoff * dt
+        return r / (r + 1.0)
+
+    def filter(self, x, t):
+        if self.t_prev is None:
+            self.t_prev = t
+            self.x_prev = float(x)
+            return self.x_prev
+        dt = max(t - self.t_prev, 1e-3)
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(dt, self.d_cutoff)
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = self._alpha(dt, cutoff)
+        x_hat = a * x + (1.0 - a) * self.x_prev
+        self.t_prev = t
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        return x_hat
+
+    def reset(self):
+        self.t_prev = None
+        self.dx_prev = 0.0
 
 
 # ------------------------------------------------------------ camera probe --
@@ -287,11 +356,29 @@ class CaptureThread(QThread):
         self._overlay_rgb = None        # uint8 (H, W, 3)
         self._overlay_alpha = None      # float32 (H, W) in [0, 1]
         self._overlay_present = False
+        self._overlay_luma = 0.0        # alpha-weighted mean luma at load
 
         self._opacity = 0.85
         self._scale = 1.0
+        self._skin_match = False
         self._passthrough = False
         self._face_mesh = None
+
+        # Tracking state (created on first detected face, reset when the
+        # face is lost for FACE_LOST_RESET_FRAMES).
+        self._f_cx = None
+        self._f_cy = None
+        self._f_tw = None
+        self._f_th = None
+        self._f_ang = None
+        self._f_wf = None
+        self._frame_idx = 0
+        self._lost_frames = 0
+        self._cache_key = None
+        self._cache_ov = None
+        self._cache_al = None
+        self._gain = 1.0
+        self._f_gain = None
 
     # ---- controls called from the UI thread ----
 
@@ -300,12 +387,25 @@ class CaptureThread(QThread):
             self._overlay_rgb = rgb
             self._overlay_alpha = alpha
             self._overlay_present = True
+            # Alpha-weighted mean luma, the reference for brightness matching:
+            # only visible pixels count.
+            weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            luma = rgb.astype(np.float32) @ weights
+            denom = float(alpha.sum())
+            self._overlay_luma = (float((luma * alpha).sum()) / denom
+                                  if denom > 1e-6 else float(luma.mean()))
+            self._gain = 1.0
+            self._f_gain = OneEuroFilter(1.0, min_cutoff=0.6, beta=0.2)
 
     def clear_overlay(self) -> None:
         with self._overlay_lock:
             self._overlay_rgb = None
             self._overlay_alpha = None
             self._overlay_present = False
+        self._gain = 1.0
+
+    def set_skin_match(self, enabled: bool) -> None:
+        self._skin_match = bool(enabled)
 
     def set_opacity(self, value: int) -> None:
         self._opacity = value / 100.0
@@ -397,6 +497,7 @@ class CaptureThread(QThread):
                 self.msleep(15)
                 continue
             failures = 0
+            self._frame_idx += 1
 
             # Drivers sometimes ignore the requested resolution; normalize so
             # the virtual camera dimensions always match the pushed frames.
@@ -407,11 +508,26 @@ class CaptureThread(QThread):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             if not self._passthrough and self._overlay_present:
-                result = self._face_mesh.process(rgb)
+                # MediaPipe landmarks are normalized, so detection on a
+                # downscaled copy yields the same coordinates at a fraction
+                # of the CPU cost on 720p/1080p input.
+                proc = rgb
+                if rgb.shape[1] > MESH_MAX_WIDTH:
+                    det_scale = MESH_MAX_WIDTH / rgb.shape[1]
+                    proc = cv2.resize(
+                        rgb, (MESH_MAX_WIDTH,
+                              max(2, int(round(rgb.shape[0] * det_scale)))),
+                        interpolation=cv2.INTER_AREA)
+                result = self._face_mesh.process(proc)
                 landmarks = (result.multi_face_landmarks[0].landmark
                              if result.multi_face_landmarks else None)
                 if landmarks is not None:
-                    self._composite(rgb, landmarks)
+                    self._lost_frames = 0
+                    self._composite(rgb, landmarks, self._frame_idx / TARGET_FPS)
+                else:
+                    self._lost_frames += 1
+                    if self._lost_frames == FACE_LOST_RESET_FRAMES:
+                        self._reset_tracking()
                 # No face: emit the untouched frame.
 
             self.frame_ready.emit(rgb)
@@ -426,7 +542,89 @@ class CaptureThread(QThread):
 
     # ---- compositing ----
 
-    def _composite(self, frame_rgb: np.ndarray, landmarks) -> None:
+    def _reset_tracking(self):
+        self._f_cx = self._f_cy = self._f_tw = self._f_th = None
+        self._f_ang = self._f_wf = None
+        self._cache_key = None
+
+    def _face_geometry(self, landmarks, frame_w, frame_h):
+        """Raw (unfiltered) overlay placement for one frame.
+
+        Returns None if the face is too small to matter. Placement is built
+        from stable anchors rather than raw bounding-box extremes:
+        - rotation from the eye line (33/133 vs 362/263),
+        - horizontal center pulled toward the nose tip (1) so the overlay
+          follows head yaw,
+        - width foreshortened as the head turns (cheeks 234/454 vs nose),
+        - sizes from the landmark bounding box with the spec's 1.2 padding.
+        """
+        count = len(landmarks)
+        xs = np.fromiter((lm.x for lm in landmarks), dtype=np.float64, count=count)
+        ys = np.fromiter((lm.y for lm in landmarks), dtype=np.float64, count=count)
+        x_min, x_max = xs.min() * frame_w, xs.max() * frame_w
+        y_min, y_max = ys.min() * frame_h, ys.max() * frame_h
+        face_w = x_max - x_min
+        face_h = y_max - y_min
+        if face_w < 8 or face_h < 8:
+            return None
+
+        lx = (landmarks[33].x + landmarks[133].x) * 0.5 * frame_w
+        ly = (landmarks[33].y + landmarks[133].y) * 0.5 * frame_h
+        rx = (landmarks[362].x + landmarks[263].x) * 0.5 * frame_w
+        ry = (landmarks[362].y + landmarks[263].y) * 0.5 * frame_h
+        angle = math.degrees(math.atan2(ry - ly, rx - lx))
+
+        nose_x = landmarks[1].x * frame_w
+        cheek_l = landmarks[234].x * frame_w
+        cheek_r = landmarks[454].x * frame_w
+        denom = cheek_r - cheek_l
+        if abs(denom) >= 1.0:
+            yaw_ratio = min(max((nose_x - cheek_l) / denom, 0.0), 1.0)
+        else:
+            yaw_ratio = 0.5
+        # 0.5 = facing camera -> factor 1.0; turning shrinks the visible face
+        # width, so the overlay must narrow with it (capped at 70 degrees
+        # worth of narrowing so a full profile still looks sane).
+        width_factor = 0.75 + 0.25 * math.cos(
+            math.radians(min(abs(yaw_ratio - 0.5) * 155.0, 70.0)))
+
+        cx = (x_min + x_max) * 0.5 + 0.3 * (nose_x - (x_min + x_max) * 0.5)
+        cy = (y_min + y_max) * 0.5
+        tw = face_w * self._scale * 1.2
+        th = face_h * self._scale * 1.2
+        return {"cx": cx, "cy": cy, "tw": tw, "th": th,
+                "angle": angle, "wf": width_factor}
+
+    def _init_filters(self, geom):
+        self._f_cx = OneEuroFilter(geom["cx"], min_cutoff=1.2, beta=0.02)
+        self._f_cy = OneEuroFilter(geom["cy"], min_cutoff=1.2, beta=0.02)
+        self._f_tw = OneEuroFilter(geom["tw"], min_cutoff=1.0, beta=0.02)
+        self._f_th = OneEuroFilter(geom["th"], min_cutoff=1.0, beta=0.02)
+        self._f_ang = OneEuroFilter(geom["angle"], min_cutoff=1.5, beta=0.03)
+        self._f_wf = OneEuroFilter(geom["wf"], min_cutoff=1.0, beta=1.5)
+
+    def _update_gain(self, frame_rgb, cx, cy, tw, th, t):
+        """Sample face-region brightness for the skin/brightness match."""
+        frame_h, frame_w = frame_rgb.shape[:2]
+        x0 = max(int(cx - tw / 2), 0)
+        y0 = max(int(cy - th / 2), 0)
+        x1 = min(int(cx + tw / 2), frame_w)
+        y1 = min(int(cy + th / 2), frame_h)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return
+        region = frame_rgb[y0:y1, x0:x1]
+        scale = min(1.0, 48.0 / max(region.shape[0], region.shape[1]))
+        if scale < 1.0:
+            region = cv2.resize(region, (max(2, int(region.shape[1] * scale)),
+                                         max(2, int(region.shape[0] * scale))))
+        weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        face_luma = float((region.astype(np.float32) @ weights).mean())
+        target = min(max(face_luma / max(self._overlay_luma, 1.0), 0.72), 1.45)
+        if self._f_gain is None:
+            self._f_gain = OneEuroFilter(1.0, min_cutoff=0.6, beta=0.2)
+        self._gain = self._f_gain.filter(target, t)
+
+    def _composite(self, frame_rgb: np.ndarray, landmarks, t: float) -> None:
         with self._overlay_lock:
             overlay_rgb = self._overlay_rgb
             overlay_alpha = self._overlay_alpha
@@ -435,48 +633,81 @@ class CaptureThread(QThread):
             return
 
         frame_h, frame_w = frame_rgb.shape[:2]
-
-        # Face bounding box from all 468 landmarks (normalized -> pixels).
-        xs = np.fromiter((lm.x for lm in landmarks), dtype=np.float64)
-        ys = np.fromiter((lm.y for lm in landmarks), dtype=np.float64)
-        x_min, x_max = xs.min() * frame_w, xs.max() * frame_w
-        y_min, y_max = ys.min() * frame_h, ys.max() * frame_h
-        face_w = x_max - x_min
-        face_h = y_max - y_min
-        if face_w < 4 or face_h < 4:
+        geom = self._face_geometry(landmarks, frame_w, frame_h)
+        if geom is None:
             return
 
-        # Rotation from the eye line: left eye = 33/133, right eye = 362/263.
-        lx = (landmarks[33].x + landmarks[133].x) * 0.5 * frame_w
-        ly = (landmarks[33].y + landmarks[133].y) * 0.5 * frame_h
-        rx = (landmarks[362].x + landmarks[263].x) * 0.5 * frame_w
-        ry = (landmarks[362].y + landmarks[263].y) * 0.5 * frame_h
-        angle = math.degrees(math.atan2(ry - ly, rx - lx))
+        if self._f_cx is None:
+            self._init_filters(geom)
 
-        # Target size: face box * user scale * 1.2 padding factor.
-        target_w = max(2, int(round(face_w * self._scale * 1.2)))
-        target_h = max(2, int(round(face_h * self._scale * 1.2)))
+        # One-euro smoothing: rock steady when the head is still, no
+        # perceptible lag during fast motion (adaptive cutoff).
+        cx = self._f_cx.filter(geom["cx"], t)
+        cy = self._f_cy.filter(geom["cy"], t)
+        tw = self._f_tw.filter(geom["tw"], t) * self._f_wf.filter(geom["wf"], t)
+        th = self._f_th.filter(geom["th"], t)
+        angle = min(max(self._f_ang.filter(geom["angle"], t), -60.0), 60.0)
 
-        interp = cv2.INTER_AREA if target_w < overlay_rgb.shape[1] else cv2.INTER_LINEAR
-        ov = cv2.resize(overlay_rgb, (target_w, target_h), interpolation=interp)
-        al = cv2.resize(overlay_alpha, (target_w, target_h), interpolation=interp)
+        target_w = max(2, int(round(tw)))
+        target_h = max(2, int(round(th)))
 
-        # Positive atan2 angle (right eye lower on screen) means the overlay
-        # must rotate clockwise on screen; getRotationMatrix2D is positive-
-        # counter-clockwise, hence the negated angle (verified empirically).
-        rot_matrix = cv2.getRotationMatrix2D(
-            (target_w / 2.0, target_h / 2.0), -angle, 1.0)
-        ov = cv2.warpAffine(ov, rot_matrix, (target_w, target_h),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        al = cv2.warpAffine(al, rot_matrix, (target_w, target_h),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        # Warp cache: resize/rotate/feather only rerun when the quantized
+        # geometry actually changes - a still head costs almost nothing
+        # because the filters make the parameters settle on fixed values.
+        cache_key = (target_w, target_h, int(angle * 2.0))
+        if cache_key != self._cache_key:
+            interp = (cv2.INTER_AREA
+                      if target_w < overlay_rgb.shape[1] else cv2.INTER_LINEAR)
+            ov = cv2.resize(overlay_rgb, (target_w, target_h),
+                            interpolation=interp)
+            al = cv2.resize(overlay_alpha, (target_w, target_h),
+                            interpolation=interp)
+            # Positive atan2 angle (right eye lower on screen) means the
+            # overlay must rotate clockwise on screen; getRotationMatrix2D is
+            # positive-counter-clockwise, hence the negated angle (verified
+            # empirically). The warp canvas is expanded to the rotated
+            # bounding box so corners - and the feathered alpha along them -
+            # never clip against the original rectangle.
+            rad = math.radians(abs(angle))
+            sin_a, cos_a = math.sin(rad), math.cos(rad)
+            rot_w = int(math.ceil(target_w * cos_a + target_h * sin_a))
+            rot_h = int(math.ceil(target_w * sin_a + target_h * cos_a))
+            rot_matrix = cv2.getRotationMatrix2D(
+                (target_w / 2.0, target_h / 2.0), -angle, 1.0)
+            rot_matrix[0, 2] += (rot_w - target_w) / 2.0
+            rot_matrix[1, 2] += (rot_h - target_h) / 2.0
+            ov = cv2.warpAffine(ov, rot_matrix, (rot_w, rot_h),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            al = cv2.warpAffine(al, rot_matrix, (rot_w, rot_h),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            # Feathered edges: a hard alpha cutout screams "pasted PNG"; a
+            # soft falloff melts the overlay into the skin.
+            k = int(max(3, round(min(target_w, target_h) * FEATHER_FRACTION)))
+            if k % 2 == 0:
+                k += 1
+            al = cv2.GaussianBlur(al, (k, k), 0)
+            self._cache_key = cache_key
+            self._cache_ov = ov
+            self._cache_al = al
 
-        # Position centered on the face box, clamped to the frame; the overlay
-        # is cropped wherever it would fall outside.
-        ox = int(round((x_min + x_max) / 2.0 - target_w / 2.0))
-        oy = int(round((y_min + y_max) / 2.0 - target_h / 2.0))
+        ov = self._cache_ov
+        al = self._cache_al
+
+        if self._skin_match and self._frame_idx % 4 == 0:
+            self._update_gain(frame_rgb, cx, cy, target_w, target_h, t)
+        if self._skin_match and abs(self._gain - 1.0) > 0.02:
+            ov = np.clip(ov.astype(np.float32) * self._gain,
+                         0.0, 255.0).astype(np.uint8)
+
+        # The cached canvas is rotation-centered on the same face-box center,
+        # so placement stays a simple centered blit, clamped to the frame;
+        # the overlay is cropped wherever it would fall outside.
+        rot_w = ov.shape[1]
+        rot_h = ov.shape[0]
+        ox = int(round(cx - rot_w / 2.0))
+        oy = int(round(cy - rot_h / 2.0))
         x0, y0 = max(ox, 0), max(oy, 0)
         x1, y1 = min(ox + target_w, frame_w), min(oy + target_h, frame_h)
         if x1 <= x0 or y1 <= y0:
@@ -600,6 +831,13 @@ class MainWindow(QWidget):
 
         self.scale_label = QLabel("100%")
         row2.addWidget(self.scale_label)
+
+        self.skin_check = QCheckBox("Skin")
+        self.skin_check.setToolTip(
+            "Match the overlay's brightness to the lighting on your face.\n"
+            "For photographic overlays; leave off for graphics/emoji masks.")
+        self.skin_check.toggled.connect(self._on_skin_toggled)
+        row2.addWidget(self.skin_check)
 
         row2.addStretch()
         root.addLayout(row2)
@@ -763,6 +1001,10 @@ class MainWindow(QWidget):
         if self.thread is not None:
             self.thread.set_scale(value)
 
+    def _on_skin_toggled(self, checked: bool):
+        if self.thread is not None:
+            self.thread.set_skin_match(checked)
+
     # ---- start / stop ----
 
     def _on_start(self):
@@ -782,6 +1024,7 @@ class MainWindow(QWidget):
 
         self.thread.set_opacity(self.opacity_slider.value())
         self.thread.set_scale(self.scale_slider.value())
+        self.thread.set_skin_match(self.skin_check.isChecked())
         if self._pending_overlay is not None:
             rgb, alpha = self._pending_overlay
             self.thread.set_overlay(rgb, alpha)
