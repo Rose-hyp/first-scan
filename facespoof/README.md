@@ -13,8 +13,15 @@ by presenting an overlay instead.
 
 - Windows 10/11
 - Python 3.10, 3.11 or 3.12 — **64-bit** (MediaPipe has no wheels outside 3.9–3.12)
-- A virtual camera driver — install [OBS Studio](https://obsproject.com/)
-  (its bundled "OBS Virtual Camera" is the default sink)
+- A virtual camera driver — `setup.bat` **auto-installs
+  [Unity Capture](https://github.com/schellingb/UnityCapture)** (a ~2 MB
+  DirectShow filter, no OBS required). OBS Studio's "OBS Virtual Camera" is
+  also supported if you prefer it.
+
+The app tries every registered virtual camera backend automatically and uses
+the first that works. Unity Capture appears to other apps as
+**"Unity Video Capture"**; OBS's appears as "OBS Virtual Camera".
+To uninstall Unity Capture later: `regsvr32 /u "%LocalAppData%\UnityCapture\UnityCaptureFilter64.dll"`
 
 ## Setup (easy way)
 
@@ -97,8 +104,9 @@ fails to initialize the app keeps streaming in passthrough (no overlay).
 
 - **START disabled, "Error: No virtual camera driver"** — the *output* side is
   missing, not your camera (the source dropdown lists your physical cameras).
-  Re-run `setup.bat` and answer **Y** to auto-install OBS Studio, or install
-  it yourself: https://obsproject.com/ — then start the app again.
+  Re-run `setup.bat` — it installs and registers the Unity Capture filter
+  automatically (one UAC prompt). Hover the START button or the status label
+  to see the exact driver error.
 - **"Error: No device at index N"** — the camera is held by another
   application or the index vanished; pick another entry.
 - **Black preview but virtual camera works** — some drivers ignore requested

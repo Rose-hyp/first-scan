@@ -120,36 +120,57 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem ---- 8) virtual camera driver - required for the app to output anything ----
-echo [*] Checking virtual camera driver ...
-.venv\Scripts\python.exe -c "import pyvirtualcam,sys;sys.exit(0 if pyvirtualcam.camera_count()>0 else 1)" >nul 2>nul
+rem ---- 8) virtual camera driver - Unity Capture by default, no OBS needed ----
+set "UCDIR=%LocalAppData%\UnityCapture"
+set "UCDLL=%UCDIR%\UnityCaptureFilter64.dll"
+set "PROBE_VCAM=import pyvirtualcam;c=pyvirtualcam.Camera(640,480,fps=30);c.close()"
+
+echo [*] Checking for a virtual camera driver ...
+.venv\Scripts\python.exe -c "%PROBE_VCAM%" >nul 2>nul
 if not errorlevel 1 (
     echo [+] Virtual camera driver found.
     goto setup_done
 )
-echo [!] No virtual camera driver. The app needs OBS Virtual Camera as its output.
-set "ANSWER="
-set /p ANSWER=Download and install OBS Studio automatically, about 150 MB [Y/n]: 
-if /i "%ANSWER%"=="n" goto skip_obs
-echo [*] Finding the latest OBS Studio release ...
-powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $r=Invoke-RestMethod 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'; $u=($r.assets | Where-Object { $_.name -like '*Full-Installer-x64.exe' } | Select-Object -First 1).browser_download_url; Write-Host ('    ' + $u); Invoke-WebRequest -Uri $u -OutFile ($env:TEMP + '\obs-setup.exe')"
-if not exist "%TEMP%\obs-setup.exe" (
-    echo [!] Download failed. Install OBS manually: https://obsproject.com/
-    goto setup_done
+
+echo [!] No virtual camera driver installed yet.
+echo     Installing Unity Capture - a tiny DirectShow virtual camera. No OBS needed.
+if exist "%UCDLL%" goto uc_register
+if not exist "%UCDIR%" mkdir "%UCDIR%"
+echo [*] Downloading Unity Capture filter ...
+curl.exe -fL -o "%UCDLL%" "https://raw.githubusercontent.com/schellingb/UnityCapture/master/Install/UnityCaptureFilter64.dll" >nul 2>nul
+if not errorlevel 1 goto uc_register
+powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/schellingb/UnityCapture/master/Install/UnityCaptureFilter64.dll' -OutFile ($env:LOCALAPPDATA + '\UnityCapture\UnityCaptureFilter64.dll')"
+if not exist "%UCDLL%" (
+    echo [!] Download failed. Get Unity Capture manually: https://github.com/schellingb/UnityCapture
+    goto uc_fail
 )
-echo [*] Installing OBS Studio - approve the Windows UAC prompt ...
-powershell -NoProfile -Command "Start-Process -FilePath ($env:TEMP + '\obs-setup.exe') -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Verb RunAs -Wait"
-.venv\Scripts\python.exe -c "import pyvirtualcam,sys;sys.exit(0 if pyvirtualcam.camera_count()>0 else 1)" >nul 2>nul
-if errorlevel 1 (
-    echo [!] OBS installed but the virtual camera is not registered yet.
-    echo     Open OBS once, or reboot, then run run.bat again.
-) else (
-    echo [+] OBS Virtual Camera ready.
-)
+:uc_register
+echo [*] Registering the virtual camera - approve the Windows UAC prompt ...
+powershell -NoProfile -Command "Start-Process -FilePath 'regsvr32.exe' -ArgumentList ('/s \"' + ($env:LOCALAPPDATA + '\UnityCapture\UnityCaptureFilter64.dll') + '\"') -Verb RunAs -Wait"
+.venv\Scripts\python.exe -c "%PROBE_VCAM%" >nul 2>nul
+if not errorlevel 1 goto uc_ready
+.venv\Scripts\python.exe -c "import ctypes;ctypes.WinDLL(r'%UCDLL%')" >nul 2>nul
+if errorlevel 1 goto uc_runtime
+goto uc_fail
+:uc_runtime
+echo [*] Installing the Visual C++ runtime the filter depends on ...
+set "VCREXE=%TEMP%\vc_redist.x64.exe"
+curl.exe -fL -o "%VCREXE%" "https://aka.ms/vs/17/release/vc_redist.x64.exe" >nul 2>nul
+if not errorlevel 1 goto uc_run_install
+powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile ($env:TEMP + '\vc_redist.x64.exe')"
+:uc_run_install
+if not exist "%VCREXE%" goto uc_fail
+powershell -NoProfile -Command "Start-Process -FilePath ($env:TEMP + '\vc_redist.x64.exe') -ArgumentList '/install','/quiet','/norestart' -Verb RunAs -Wait"
+.venv\Scripts\python.exe -c "%PROBE_VCAM%" >nul 2>nul
+if not errorlevel 1 goto uc_ready
+:uc_fail
+echo [!] Unity Capture did not register.
+echo     - If you declined the UAC prompt, re-run setup.bat and approve it.
+echo     - If it still fails, reboot and run run.bat again.
+echo     - Alternative: install OBS Studio - https://obsproject.com/ - then re-run setup.bat.
 goto setup_done
-:skip_obs
-echo [!] Skipped. START stays disabled until a virtual camera driver is installed.
-echo     Get OBS from: https://obsproject.com/
+:uc_ready
+echo [+] Unity Capture virtual camera ready - it appears as: Unity Video Capture.
 :setup_done
 echo.
 echo [+] Setup complete.

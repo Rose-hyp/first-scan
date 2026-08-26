@@ -38,15 +38,14 @@ try:
 except Exception:
     _mp = None
 
-# pyvirtualcam availability is probed once at startup; its Camera object is
-# created inside the processing thread.
+# pyvirtualcam: availability is probed by opening a short-lived camera,
+# not by version-specific helper functions (modern versions expose none).
 try:
     import pyvirtualcam
-    _VCAM_COUNT = pyvirtualcam.camera_count()
 except Exception:
     pyvirtualcam = None
-    _VCAM_COUNT = 0
 
+UNITY_CAPTURE_URL = "https://github.com/schellingb/UnityCapture"
 OBS_DOWNLOAD_URL = "https://obsproject.com/"
 
 CAMERA_PROBE_MAX_INDEX = 9
@@ -254,7 +253,7 @@ class CaptureThread(QThread):
                 fmt=pyvirtualcam.PixelFormat.RGB,
             )
         except Exception:
-            self.status_changed.emit("Error: Install OBS Virtual Camera first", "error")
+            self.status_changed.emit("Error: No virtual camera driver", "error")
             cap.release()
             return
 
@@ -375,6 +374,7 @@ class MainWindow(QWidget):
         self.thread = None
         self._pending_overlay = None  # (rgb, alpha) applied when capture starts
         self._no_signal_pixmap = self._make_no_signal_pixmap()
+        self._vcam_ok, self._vcam_detail = probe_virtual_camera()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
@@ -492,11 +492,17 @@ class MainWindow(QWidget):
             self._set_status("Error: No device at index 0", "error")
 
     def _check_virtual_camera(self):
-        if _VCAM_COUNT == 0:
+        if not self._vcam_ok:
             self.start_button.setEnabled(False)
-            self.start_button.setToolTip(
-                f"A virtual camera driver is required. Install OBS: {OBS_DOWNLOAD_URL}")
+            tip = (f"A virtual camera driver is required (OBS Virtual Camera "
+                   f"or Unity Capture).\n\n{self._vcam_detail}\n\n"
+                   f"OBS: {OBS_DOWNLOAD_URL}\nUnity Capture: {UNITY_CAPTURE_URL}")
+            self.start_button.setToolTip(tip)
             self._set_status("Error: No virtual camera driver", "error")
+        else:
+            self.start_button.setToolTip(
+                "Outputs to the first available virtual camera "
+                "(OBS Virtual Camera or Unity Video Capture).")
 
     @staticmethod
     def _make_no_signal_pixmap():
@@ -587,8 +593,10 @@ class MainWindow(QWidget):
 
     def _on_worker_status(self, text: str, kind: str):
         self._set_status(text, "error" if kind.startswith("error") else kind)
-        if text == "Error: Install OBS Virtual Camera first":
-            self.status_label.setToolTip(f"Install OBS Studio: {OBS_DOWNLOAD_URL}")
+        if text == "Error: No virtual camera driver":
+            self.status_label.setToolTip(
+                f"Install OBS: {OBS_DOWNLOAD_URL}\n"
+                f"Or Unity Capture: {UNITY_CAPTURE_URL}")
         if kind == "error" and self.thread is not None:
             # Fatal capture errors end the loop; the thread emits finished
             # right after and button state is restored in _on_thread_finished.
@@ -597,7 +605,7 @@ class MainWindow(QWidget):
 
     def _on_thread_finished(self):
         self.thread = None
-        self.start_button.setEnabled(self.camera_box.count() > 0 and _VCAM_COUNT > 0)
+        self.start_button.setEnabled(self.camera_box.count() > 0 and self._vcam_ok)
         self.stop_button.setEnabled(False)
         if self.status_label.text() == "Running":
             self._set_status("Idle", "idle")
@@ -623,6 +631,24 @@ class MainWindow(QWidget):
             self.thread.stop()
             self.thread.wait(3000)
         super().closeEvent(event)
+
+
+def probe_virtual_camera():
+    """Open and immediately close a virtual camera to detect a usable driver.
+
+    Works with the OBS Virtual Camera and Unity Capture backends; returns
+    (ok, error_detail). Camera() with no backend tries every registered
+    backend in order, so any installed driver satisfies the probe.
+    """
+    if pyvirtualcam is None:
+        return False, "pyvirtualcam is not installed"
+    try:
+        cam = pyvirtualcam.Camera(640, 480, fps=30,
+                                  fmt=pyvirtualcam.PixelFormat.RGB)
+        cam.close()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
 
 def main():
