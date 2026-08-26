@@ -88,6 +88,7 @@ the target machine.
 | Opacity slider | 0–100 % blend of the overlay over the face (default 85) |
 | Scale slider | 50–200 % of the auto-computed face-box size (default 100) |
 | Tracking HUD | Draws green boxes around every detected face — debugging aid; **the boxes are visible in the output**, turn off for real use |
+| Black if no face | **Privacy fail-safe** — the moment no face is detected to carry the overlay (or tracking is down), the output turns to a black screen instead of your real face. Toggles live, any time |
 | Snapshot | Save the current composited frame as a PNG |
 | START / STOP | Open or release camera + virtual camera sink |
 
@@ -150,7 +151,9 @@ overlay is:
 4. alpha-blended at the chosen opacity.
 
 If no face is detected the raw frame passes through untouched (enable the
-**Tracking HUD** to see exactly what the detector sees).
+**Tracking HUD** to see exactly what the detector sees). With **Black if
+no face** enabled, a lost face blacks the output out instead — your real
+face never reaches the virtual camera.
 
 ## Troubleshooting
 
