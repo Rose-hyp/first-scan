@@ -20,6 +20,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -1008,7 +1009,7 @@ class MainWindow(QWidget):
     # ---- start / stop ----
 
     def _on_start(self):
-        if self._scanning or self.thread is not None:
+        if self._scanning or self.thread is not None or not self._vcam_ok:
             return
         index = self.camera_box.currentData()
         if index is None or index < 0:
