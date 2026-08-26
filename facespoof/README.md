@@ -95,8 +95,10 @@ fails to initialize the app keeps streaming in passthrough (no overlay).
 
 ## Troubleshooting
 
-- **START disabled, "Error: No virtual camera driver"** — install OBS Studio,
-  then restart the app. https://obsproject.com/
+- **START disabled, "Error: No virtual camera driver"** — the *output* side is
+  missing, not your camera (the source dropdown lists your physical cameras).
+  Re-run `setup.bat` and answer **Y** to auto-install OBS Studio, or install
+  it yourself: https://obsproject.com/ — then start the app again.
 - **"Error: No device at index N"** — the camera is held by another
   application or the index vanished; pick another entry.
 - **Black preview but virtual camera works** — some drivers ignore requested

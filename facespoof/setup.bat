@@ -120,6 +120,37 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem ---- 8) virtual camera driver - required for the app to output anything ----
+echo [*] Checking virtual camera driver ...
+.venv\Scripts\python.exe -c "import pyvirtualcam,sys;sys.exit(0 if pyvirtualcam.camera_count()>0 else 1)" >nul 2>nul
+if not errorlevel 1 (
+    echo [+] Virtual camera driver found.
+    goto setup_done
+)
+echo [!] No virtual camera driver. The app needs OBS Virtual Camera as its output.
+set "ANSWER="
+set /p ANSWER=Download and install OBS Studio automatically, about 150 MB [Y/n]: 
+if /i "%ANSWER%"=="n" goto skip_obs
+echo [*] Finding the latest OBS Studio release ...
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $r=Invoke-RestMethod 'https://api.github.com/repos/obsproject/obs-studio/releases/latest'; $u=($r.assets | Where-Object { $_.name -like '*Full-Installer-x64.exe' } | Select-Object -First 1).browser_download_url; Write-Host ('    ' + $u); Invoke-WebRequest -Uri $u -OutFile ($env:TEMP + '\obs-setup.exe')"
+if not exist "%TEMP%\obs-setup.exe" (
+    echo [!] Download failed. Install OBS manually: https://obsproject.com/
+    goto setup_done
+)
+echo [*] Installing OBS Studio - approve the Windows UAC prompt ...
+powershell -NoProfile -Command "Start-Process -FilePath ($env:TEMP + '\obs-setup.exe') -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Verb RunAs -Wait"
+.venv\Scripts\python.exe -c "import pyvirtualcam,sys;sys.exit(0 if pyvirtualcam.camera_count()>0 else 1)" >nul 2>nul
+if errorlevel 1 (
+    echo [!] OBS installed but the virtual camera is not registered yet.
+    echo     Open OBS once, or reboot, then run run.bat again.
+) else (
+    echo [+] OBS Virtual Camera ready.
+)
+goto setup_done
+:skip_obs
+echo [!] Skipped. START stays disabled until a virtual camera driver is installed.
+echo     Get OBS from: https://obsproject.com/
+:setup_done
 echo.
 echo [+] Setup complete.
 echo     Run the app:     run.bat
